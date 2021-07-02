@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use grid_sdk::error::InternalError;
 use grid_sdk::protos;
 use sawtooth_sdk::signing;
 use std::error::Error as StdError;
@@ -32,6 +33,7 @@ pub enum CliError {
     GridProtoError(protos::ProtoConversionError),
     SabreProtoError(sabre_sdk::protos::ProtoConversionError),
     DaemonError(String),
+    InternalError(InternalError),
 }
 
 impl StdError for CliError {
@@ -49,6 +51,7 @@ impl StdError for CliError {
             CliError::GridProtoError(err) => Some(err),
             CliError::SabreProtoError(err) => Some(err),
             CliError::DaemonError(_) => None,
+            CliError::InternalError(_) => None,
         }
     }
 }
@@ -70,6 +73,7 @@ impl std::fmt::Display for CliError {
             CliError::GridProtoError(ref err) => write!(f, "Grid Proto Error: {}", err),
             CliError::SabreProtoError(ref err) => write!(f, "Sabre Proto Error: {}", err),
             CliError::DaemonError(ref err) => write!(f, "{}", err.replace("\"", "")),
+            CliError::InternalError(_) => write!(f, "{}", "".to_string()),
         }
     }
 }
