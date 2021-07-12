@@ -62,7 +62,7 @@ pub struct GridPropertyDefinitionSlice {
     pub struct_properties: Vec<GridPropertyDefinitionSlice>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub enum DataType {
     Bytes,
     Boolean,
