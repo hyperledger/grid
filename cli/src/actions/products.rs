@@ -18,6 +18,7 @@ use crate::actions::Paging;
 use crate::http::submit_batches;
 use crate::transaction::product_batch_builder;
 use cylinder::Signer;
+use grid_sdk::error::InternalError;
 use grid_sdk::pike::addressing::PIKE_NAMESPACE;
 use grid_sdk::product::addressing::GRID_PRODUCT_NAMESPACE;
 use grid_sdk::product::gdsn::{get_trade_items_from_xml, GDSN_3_1_PROPERTY_NAME};
@@ -452,7 +453,15 @@ pub fn create_product_payloads_from_yaml(
             Namespace::Gs1 => "gs1_product",
         };
         let schema = get_schema(url, namespace, service_id)?;
-        payloads.push(yml.into_payload(schema.properties)?);
+        payloads.push(
+            yml.into_payload(schema.properties)
+                .map_err(|err| match err {
+                    CliError::InternalError(_) => {
+                        CliError::UserError(format!("Errors occurred while processing: {}", path))
+                    }
+                    err => err,
+                })?,
+        );
     }
 
     Ok(payloads)
@@ -488,7 +497,15 @@ pub fn update_product_payloads_from_yaml(
             Namespace::Gs1 => "gs1_product",
         };
         let schema = get_schema(url, namespace, service_id)?;
-        payloads.push(yml.into_payload(schema.properties)?);
+        payloads.push(
+            yml.into_payload(schema.properties)
+                .map_err(|err| match err {
+                    CliError::InternalError(_) => {
+                        CliError::UserError(format!("Errors occurred while processing: {}", path))
+                    }
+                    err => err,
+                })?,
+        );
     }
 
     Ok(payloads)
@@ -564,118 +581,143 @@ fn yaml_to_property_values(
     definitions: Vec<GridPropertyDefinitionSlice>,
 ) -> Result<Vec<PropertyValue>, CliError> {
     let mut property_values = Vec::new();
+    let mut are_errors_present = false;
 
     for def in definitions {
-        let value = if let Some(value) = properties.get(&def.name) {
-            value
-        } else if !def.required {
-            continue;
-        } else {
-            if def.name == GDSN_3_1_PROPERTY_NAME {
-                continue;
+        match get_property_value_from_property_definition(&properties, def) {
+            Ok(Some(property_value)) => property_values.push(property_value),
+            Ok(None) => (),
+            Err(CliError::UserError(message)) | Err(CliError::PayloadError(message)) => {
+                error!("{}", message);
+                are_errors_present = true;
             }
-            return Err(CliError::UserError(format!("Field {} not found", def.name)));
-        };
-
-        match def.data_type {
-            schemas::DataType::Bytes => {
-                let mut f = File::open(&serde_yaml::from_value::<String>(value.clone())?)?;
-                let mut buffer = Vec::new();
-                f.read_to_end(&mut buffer)?;
-
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name)
-                    .with_data_type(def.data_type.into())
-                    .with_bytes_value(buffer)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-
-                property_values.push(property_value);
+            Err(CliError::InternalError(_)) => {
+                are_errors_present = true;
             }
-            schemas::DataType::Boolean => {
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name.clone())
-                    .with_data_type(def.data_type.into())
-                    .with_boolean_value(serde_yaml::from_value(value.clone())?)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-                property_values.push(property_value);
-            }
-            schemas::DataType::Number => {
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name.clone())
-                    .with_data_type(def.data_type.into())
-                    .with_number_value(serde_yaml::from_value(value.clone())?)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-                property_values.push(property_value);
-            }
-            schemas::DataType::String => {
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name.clone())
-                    .with_data_type(def.data_type.into())
-                    .with_string_value(serde_yaml::from_value(value.clone())?)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-                property_values.push(property_value);
-            }
-            schemas::DataType::Enum => {
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name.clone())
-                    .with_data_type(def.data_type.into())
-                    .with_enum_value(serde_yaml::from_value(value.clone())?)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-                property_values.push(property_value);
-            }
-            schemas::DataType::Struct => {
-                let properties: HashMap<String, serde_yaml::Value> =
-                    serde_yaml::from_value(value.clone())?;
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name.clone())
-                    .with_data_type(def.data_type.into())
-                    .with_struct_values(yaml_to_property_values(
-                        &properties,
-                        def.struct_properties,
-                    )?)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-                property_values.push(property_value);
-            }
-            schemas::DataType::LatLong => {
-                let lat_long = serde_yaml::from_value::<String>(value.clone())?
-                    .split(',')
-                    .map(|x| {
-                        x.parse::<i64>()
-                            .map_err(|err| CliError::PayloadError(format!("{}", err)))
-                    })
-                    .collect::<Result<Vec<i64>, CliError>>()?;
-
-                if lat_long.len() != 2 {
-                    return Err(CliError::PayloadError(format!(
-                        "{:?} is not a valid latitude longitude",
-                        lat_long
-                    )));
-                }
-
-                let lat_long = LatLongBuilder::new()
-                    .with_lat_long(lat_long[0], lat_long[1])
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-
-                let property_value = PropertyValueBuilder::new()
-                    .with_name(def.name)
-                    .with_data_type(def.data_type.into())
-                    .with_lat_long_value(lat_long)
-                    .build()
-                    .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
-
-                property_values.push(property_value);
+            Err(err) => {
+                return Err(err);
             }
         }
     }
 
-    Ok(property_values)
+    if are_errors_present {
+        Err(CliError::InternalError(InternalError::with_message(
+            "Nested Error".to_string(),
+        )))
+    } else {
+        Ok(property_values)
+    }
+}
+
+fn get_property_value_from_property_definition(
+    properties: &HashMap<String, serde_yaml::Value>,
+    def: GridPropertyDefinitionSlice,
+) -> Result<Option<PropertyValue>, CliError> {
+    let value = if let Some(value) = properties.get(&def.name) {
+        value
+    } else if !def.required {
+        return Ok(None);
+    } else {
+        if def.name == GDSN_3_1_PROPERTY_NAME {
+            return Ok(None);
+        }
+        return Err(CliError::UserError(format!("Field {} not found", def.name)));
+    };
+
+    match def.data_type {
+        schemas::DataType::Bytes => {
+            let mut f = File::open(&serde_yaml::from_value::<String>(value.clone())?)?;
+            let mut buffer = Vec::new();
+            f.read_to_end(&mut buffer)?;
+
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name)
+                .with_data_type(def.data_type.into())
+                .with_bytes_value(buffer)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+
+            Ok(Some(property_value))
+        }
+        schemas::DataType::Boolean => {
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name.clone())
+                .with_data_type(def.data_type.into())
+                .with_boolean_value(serde_yaml::from_value(value.clone())?)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+
+            Ok(Some(property_value))
+        }
+        schemas::DataType::Number => {
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name.clone())
+                .with_data_type(def.data_type.into())
+                .with_number_value(serde_yaml::from_value(value.clone())?)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+            Ok(Some(property_value))
+        }
+        schemas::DataType::String => {
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name.clone())
+                .with_data_type(def.data_type.into())
+                .with_string_value(serde_yaml::from_value(value.clone())?)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+            Ok(Some(property_value))
+        }
+        schemas::DataType::Enum => {
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name.clone())
+                .with_data_type(def.data_type.into())
+                .with_enum_value(serde_yaml::from_value(value.clone())?)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+            Ok(Some(property_value))
+        }
+        schemas::DataType::Struct => {
+            let properties: HashMap<String, serde_yaml::Value> =
+                serde_yaml::from_value(value.clone())?;
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name.clone())
+                .with_data_type(def.data_type.into())
+                .with_struct_values(yaml_to_property_values(&properties, def.struct_properties)?)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+            Ok(Some(property_value))
+        }
+        schemas::DataType::LatLong => {
+            let lat_long = serde_yaml::from_value::<String>(value.clone())?
+                .split(',')
+                .map(|x| {
+                    x.parse::<i64>()
+                        .map_err(|err| CliError::PayloadError(format!("{}", err)))
+                })
+                .collect::<Result<Vec<i64>, CliError>>()?;
+
+            if lat_long.len() != 2 {
+                return Err(CliError::PayloadError(format!(
+                    "{:?} is not a valid latitude longitude",
+                    lat_long
+                )));
+            }
+
+            let lat_long = LatLongBuilder::new()
+                .with_lat_long(lat_long[0], lat_long[1])
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+
+            let property_value = PropertyValueBuilder::new()
+                .with_name(def.name)
+                .with_data_type(def.data_type.into())
+                .with_lat_long_value(lat_long)
+                .build()
+                .map_err(|err| CliError::PayloadError(format!("{}", err)))?;
+
+            Ok(Some(property_value))
+        }
+    }
 }
 
 fn submit_payloads(
